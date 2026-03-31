@@ -24,6 +24,12 @@ class Settings(BaseSettings):
 
     # Tavily Search API
     tavily_api_key: str = os.getenv("TAVILY_API_KEY", "")
+
+    # 火山引擎 TTS
+    volc_app_id: str = os.getenv("VOLC_APP_ID", "")
+    volc_access_key: str = os.getenv("VOLC_ACCESS_KEY", "")
+    volc_secret_key: str = os.getenv("VOLC_SECRET_KEY", "")
+    volc_token: str = os.getenv("VOLC_TOKEN", "")
     
     # Request Configuration
     request_timeout: int = 30

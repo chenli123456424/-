@@ -39,10 +39,25 @@ export class ChatWebSocket {
 
       this.ws.onmessage = (event) => {
         try {
-          const msg = JSON.parse(event.data)
+          // 音频数据可能很大，先检查是否是 audio 类型再解析
+          const raw = event.data
+          // 快速检查类型，避免解析超大 JSON
+          if (raw.includes('"type":"audio"') || raw.includes('"type": "audio"')) {
+            const typeMatch = raw.match(/"type"\s*:\s*"audio"/)
+            if (typeMatch) {
+              // 提取 data 字段（Base64）
+              const dataMatch = raw.match(/"data"\s*:\s*"([^"]+)"/)
+              const langMatch = raw.match(/"lang"\s*:\s*"([^"]+)"/)
+              if (dataMatch) {
+                this.handlers.onAudio?.(dataMatch[1], langMatch?.[1] || 'zh')
+                return
+              }
+            }
+          }
+          const msg = JSON.parse(raw)
           this._dispatch(msg)
-        } catch {
-          console.error('[WS] Failed to parse message:', event.data)
+        } catch (e) {
+          console.error('[WS] Failed to parse message:', e.message)
         }
       }
     })
@@ -53,18 +68,23 @@ export class ChatWebSocket {
       case 'thought':         this.handlers.onThought?.(data);        break
       case 'thought_summary': this.handlers.onThoughtSummary?.(data); break
       case 'search':          this.handlers.onSearch?.(data);         break
+      case 'sources':         this.handlers.onSources?.(data);        break
       case 'content_patch':   this.handlers.onContentPatch?.(data);   break
+      case 'content_reset':   this.handlers.onContentReset?.();        break
       case 'retry':           this.handlers.onRetry?.(data);          break
       case 'done':            this.handlers.onDone?.();               break
       case 'stopped':         this.handlers.onStopped?.();            break
+      case 'audio':           
+        this.handlers.onAudio?.(msg.data, msg.lang)
+        break
       case 'error':           this.handlers.onError?.(data);          break
       default: console.warn('[WS] Unknown type:', type)
     }
   }
 
-  send(message) {
+  send(message, lang = 'zh', ttsEnabled = true) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ message }))
+      this.ws.send(JSON.stringify({ message, lang, tts_enabled: ttsEnabled }))
       return true
     }
     return false

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { useTheme } from '../ThemeContext'
+import { useSpeaking } from '../SpeakingContext'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 
@@ -78,6 +79,48 @@ function ThoughtPanel({ message, theme }) {
   )
 }
 
+// 清理正文中的内联引用角标和"参考来源"段落
+function cleanContent(content) {
+  return content
+    // 去掉 [1] [2][3] 这类角标
+    .replace(/\[\d+\](\[\d+\])*/g, '')
+    // 去掉结尾的"参考来源"/"参考文献"整段（从该标题到文末）
+    .replace(/\n*#{0,3}\s*(参考来源|参考文献|References|来源)[^\n]*\n[\s\S]*$/i, '')
+    .trimEnd()
+}
+
+function SourcesBar({ sources, theme }) {
+  if (!sources?.length) return null
+  return (
+    <div className="flex flex-wrap items-center gap-1.5 mt-2 pt-2" style={{ borderTop: `1px solid ${theme.border}` }}>
+      <span className="text-xs shrink-0" style={{ color: theme.textFaint }}>参考来源</span>
+      {sources.map((s, i) => {
+        const domain = s.domain || (s.url ? new URL(s.url).hostname.replace('www.', '') : null)
+        const label = domain || s.title || `来源${i + 1}`
+        const href = s.url || '#'
+        return (
+          <a
+            key={i}
+            href={href}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center gap-1 px-2 py-0.5 rounded-full text-xs transition-opacity hover:opacity-80"
+            style={{ background: theme.tagBg, color: theme.tagColor, border: `1px solid ${theme.border}` }}
+          >
+            <img
+              src={`https://www.google.com/s2/favicons?domain=${domain}&sz=16`}
+              alt=""
+              className="w-3 h-3 rounded-sm"
+              onError={e => { e.target.style.display = 'none' }}
+            />
+            {label}
+          </a>
+        )
+      })}
+    </div>
+  )
+}
+
 function ResearchPanel({ data, theme }) {
   const [open, setOpen] = useState(false)
   if (!data?.products?.length) return null
@@ -133,6 +176,7 @@ function ResearchPanel({ data, theme }) {
 
 export default function MessageBubble({ message }) {
   const { theme } = useTheme()
+  const { isSpeaking, stopAudio } = useSpeaking()
   const isUser = message.type === 'user'
 
   if (isUser) {
@@ -159,7 +203,7 @@ export default function MessageBubble({ message }) {
 
         {/* 主回答气泡 */}
         <div
-          className="px-4 py-3 rounded-2xl rounded-bl-sm text-sm leading-relaxed"
+          className="relative px-4 py-3 rounded-2xl rounded-bl-sm text-sm leading-relaxed"
           style={{
             background: message.error ? (theme.card === '#ffffff' ? '#fff0f0' : '#2d1b1b') : theme.card,
             color: message.error ? '#f85149' : theme.text,
@@ -213,8 +257,40 @@ export default function MessageBubble({ message }) {
                 ),
               }}
             >
-              {message.content}
+              {cleanContent(message.content)}
             </ReactMarkdown>
+          )}
+          {/* 来源标签 */}
+          {!message.thinking && message.sources?.length > 0 && (
+            <SourcesBar sources={message.sources} theme={theme} />
+          )}
+          {/* 朗读控制按钮 - 右下角 */}
+          {!message.thinking && !message.error && message.content && (
+            <div className="flex justify-end mt-2">
+              {isSpeaking ? (
+                <button
+                  onClick={stopAudio}
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs transition-all"
+                  style={{ background: 'rgba(248,81,73,0.12)', color: '#f87171', border: '1px solid rgba(248,81,73,0.3)' }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor">
+                    <rect x="4" y="4" width="16" height="16" rx="2"/>
+                  </svg>
+                  停止朗读
+                </button>
+              ) : (
+                <div
+                  className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg text-xs"
+                  style={{ color: theme.textFaint }}
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                    <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+                    <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+                  </svg>
+                  朗读
+                </div>
+              )}
+            </div>
           )}
         </div>
 

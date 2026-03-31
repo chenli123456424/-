@@ -15,6 +15,7 @@ import threading
 from config import settings
 from llm_wrapper import get_llm
 from services.langgraph_agent import run_agent, stream_agent
+from services.tts_service import generate_audio_async
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -298,42 +299,52 @@ async def chat_deep(request: ChatRequest):
 async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Client connected")
-    stop_flag = {"stopped": False}
 
-    async def listen_for_stop():
-        """并发监听客户端消息，收到 stop 立即设置标志"""
+    async def safe_send(data: str) -> bool:
+        """安全发送，连接已关闭时静默忽略"""
+        try:
+            await websocket.send_text(data)
+            return True
+        except Exception:
+            return False
+
+    # 所有客户端消息统一放入此队列，避免并发 recv
+    ctrl_q: asyncio.Queue = asyncio.Queue()
+
+    async def read_all_client_messages():
         try:
             while True:
                 raw = await websocket.receive_text()
-                try:
-                    payload = json.loads(raw)
-                    if payload.get("type") == "stop":
-                        logger.info("[WS] Stop signal received")
-                        stop_flag["stopped"] = True
-                except Exception:
-                    pass
+                await ctrl_q.put(raw)
         except Exception:
-            pass
+            await ctrl_q.put(None)
+
+    reader_task = asyncio.create_task(read_all_client_messages())
+    stop_flag = {"stopped": False}
 
     try:
         while True:
-            # 等待用户发送消息
-            raw = await websocket.receive_text()
+            raw = await ctrl_q.get()
+            if raw is None:
+                break
+
             try:
                 payload = json.loads(raw)
             except Exception:
-                await websocket.send_text(json.dumps({"type": "error", "data": "Invalid JSON"}))
+                await safe_send(json.dumps({"type": "error", "data": "Invalid JSON"}))
                 continue
 
             if payload.get("type") == "stop":
-                continue  # 没有正在运行的任务，忽略
-
-            message = payload.get("message", "").strip()
-            if not message:
-                await websocket.send_text(json.dumps({"type": "error", "data": "Empty message"}))
                 continue
 
-            logger.info(f"[WS] Received: {message}")
+            message = payload.get("message", "").strip()
+            tts_lang = payload.get("lang", "zh")
+            tts_enabled = payload.get("tts_enabled", True)
+            if not message:
+                await safe_send(json.dumps({"type": "error", "data": "Empty message"}))
+                continue
+
+            logger.info(f"[WS] Received: {message}, lang={tts_lang}")
             stop_flag["stopped"] = False
 
             q = queue.Queue()
@@ -352,84 +363,106 @@ async def websocket_chat(websocket: WebSocket):
             thread = threading.Thread(target=run_in_thread, daemon=True)
             thread.start()
 
-            # 启动并发监听停止信号的任务
-            stop_listener = asyncio.create_task(listen_for_stop())
+            final_answer = ""
 
-            try:
-                while True:
-                    if stop_flag["stopped"]:
-                        await websocket.send_text(json.dumps({"type": "stopped", "data": None}))
-                        break
-
+            while True:
+                while not ctrl_q.empty():
                     try:
-                        item = await loop.run_in_executor(
-                            None, lambda: q.get(timeout=0.2)
-                        )
+                        ctrl_raw = ctrl_q.get_nowait()
+                        if ctrl_raw is None:
+                            stop_flag["stopped"] = True
+                            break
+                        ctrl = json.loads(ctrl_raw)
+                        if ctrl.get("type") == "stop":
+                            logger.info("[WS] Stop signal received")
+                            stop_flag["stopped"] = True
                     except Exception:
-                        # timeout，继续检查 stop_flag
-                        continue
+                        pass
 
-                    kind, node_name, node_state = item
+                if stop_flag["stopped"]:
+                    await safe_send(json.dumps({"type": "stopped", "data": None}))
+                    break
 
-                    if kind == "error":
-                        await websocket.send_text(json.dumps({"type": "error", "data": node_name}))
-                        break
+                try:
+                    item = await loop.run_in_executor(None, lambda: q.get(timeout=0.2))
+                except Exception:
+                    continue
 
-                    if kind == "done":
-                        await websocket.send_text(json.dumps({"type": "done", "data": None}))
-                        break
+                kind, node_name, node_state = item
 
-                    if node_name == "planner" and node_state.get("thought_process"):
+                if kind == "error":
+                    await safe_send(json.dumps({"type": "error", "data": node_name}))
+                    break
+
+                if kind == "done":
+                    await safe_send(json.dumps({"type": "done", "data": None}))
+                    if final_answer and not stop_flag["stopped"] and tts_enabled:
                         try:
-                            thought_parsed = json.loads(node_state["thought_process"][0])
-                            sources = thought_parsed.get("sources", [])
-                            analysis = thought_parsed.get("analysis", "")
-                            for i, src in enumerate(sources):
-                                if stop_flag["stopped"]: break
-                                await websocket.send_text(json.dumps({
-                                    "type": "thought",
-                                    "data": {"count": i + 1, "source": src}
+                            audio_b64 = await generate_audio_async(final_answer, tts_lang)
+                            if audio_b64:
+                                await safe_send(json.dumps({
+                                    "type": "audio", "data": audio_b64, "lang": tts_lang,
                                 }))
-                                await asyncio.sleep(0.15)
-                            if analysis and not stop_flag["stopped"]:
-                                await websocket.send_text(json.dumps({
-                                    "type": "thought_summary", "data": analysis
-                                }))
-                        except Exception:
-                            pass
+                                logger.info("[WS] TTS 音频已推送")
+                        except Exception as e:
+                            logger.warning(f"[WS] TTS 失败，跳过: {e}")
+                    break
 
-                    elif node_name == "researcher" and node_state.get("research_data"):
-                        if not stop_flag["stopped"]:
-                            await websocket.send_text(json.dumps({
-                                "type": "search", "data": node_state["research_data"]
-                            }))
-
-                    elif node_name in ("synthesizer", "general_synthesizer") and node_state.get("draft_content"):
-                        answer = node_state["draft_content"]
-                        for i in range(0, len(answer), 8):
+                if node_name == "planner" and node_state.get("thought_process"):
+                    try:
+                        thought_parsed = json.loads(node_state["thought_process"][0])
+                        sources = thought_parsed.get("sources", [])
+                        analysis = thought_parsed.get("analysis", "")
+                        for i, src in enumerate(sources):
                             if stop_flag["stopped"]: break
-                            await websocket.send_text(json.dumps({
-                                "type": "content_patch", "data": answer[i:i + 8]
+                            await safe_send(json.dumps({
+                                "type": "thought", "data": {"count": i + 1, "source": src}
                             }))
-                            await asyncio.sleep(0.01)
+                            await asyncio.sleep(0.15)
+                        if analysis and not stop_flag["stopped"]:
+                            await safe_send(json.dumps({
+                                "type": "thought_summary", "data": analysis
+                            }))
+                    except Exception:
+                        pass
 
-                    elif node_name == "critic":
-                        retry_count = node_state.get("retry_count", 0)
-                        if retry_count > 0 and not stop_flag["stopped"]:
-                            await websocket.send_text(json.dumps({
-                                "type": "retry", "data": retry_count
-                            }))
-            finally:
-                stop_listener.cancel()
+                elif node_name == "researcher" and node_state.get("research_data"):
+                    if not stop_flag["stopped"]:
+                        await safe_send(json.dumps({
+                            "type": "search", "data": node_state["research_data"]
+                        }))
+
+                elif node_name in ("synthesizer", "general_synthesizer") and node_state.get("draft_content"):
+                    answer = node_state["draft_content"]
+                    final_answer = answer
+                    # 推送来源列表（供前端气泡底部展示）
+                    sources = node_state.get("search_sources", [])
+                    if sources:
+                        await safe_send(json.dumps({
+                            "type": "sources", "data": sources
+                        }))
+                    await safe_send(json.dumps({"type": "content_reset", "data": None}))
+                    for i in range(0, len(answer), 8):
+                        if stop_flag["stopped"]: break
+                        await safe_send(json.dumps({
+                            "type": "content_patch", "data": answer[i:i + 8]
+                        }))
+                        await asyncio.sleep(0.01)
+
+                elif node_name == "critic":
+                    retry_count = node_state.get("retry_count", 0)
+                    if retry_count > 0 and not stop_flag["stopped"]:
+                        await safe_send(json.dumps({
+                            "type": "retry", "data": retry_count
+                        }))
 
     except WebSocketDisconnect:
         logger.info("[WS] Client disconnected")
     except Exception as e:
         logger.error(f"[WS] Error: {str(e)}", exc_info=True)
-        try:
-            await websocket.send_text(json.dumps({"type": "error", "data": str(e)}))
-        except Exception:
-            pass
+        await safe_send(json.dumps({"type": "error", "data": str(e)}))
+    finally:
+        reader_task.cancel()
 
 
 if __name__ == "__main__":

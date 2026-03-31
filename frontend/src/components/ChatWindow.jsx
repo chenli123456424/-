@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '../ThemeContext'
+import { useSpeaking } from '../SpeakingContext'
 import MessageBubble from './MessageBubble'
 import InputBox from './InputBox'
 import { ChatWebSocket } from '../api/websocket'
@@ -10,25 +11,50 @@ const INITIAL_MESSAGES = [
 
 export default function ChatWindow() {
   const { theme } = useTheme()
+  const { isSpeaking, setIsSpeaking, ttsLang, ttsEnabled, setTtsEnabled, audioObjRef, stopAudio } = useSpeaking()
+  const ttsLangRef = useRef(ttsLang)
+  ttsLangRef.current = ttsLang  // 每次渲染都更新 ref
   const [messages, setMessages] = useState(INITIAL_MESSAGES)
   const [loading, setLoading] = useState(false)
   const [wsStatus, setWsStatus] = useState('disconnected')
   const messagesEndRef = useRef(null)
   const wsRef = useRef(null)
   const activeIdRef = useRef(null)
+  // 用 ref 保存 setIsSpeaking，避免 WebSocket 闭包捕获旧引用
+  const setIsSpeakingRef = useRef(setIsSpeaking)
+  setIsSpeakingRef.current = setIsSpeaking
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  // 用 ref 存 activeId，避免闭包问题
-  const updateActive = (updater) => {
-    setMessages(prev => prev.map(m =>
-      m.id === activeIdRef.current ? updater(m) : m
-    ))
+  const playAudio = (base64Data) => {
+    try {
+      const bytes = Uint8Array.from(atob(base64Data), c => c.charCodeAt(0))
+      const blob = new Blob([bytes], { type: 'audio/mp3' })
+      const url = URL.createObjectURL(blob)
+      const audio = new Audio(url)
+      audioObjRef.current = audio  // 存引用，供外部控制
+      audio.play()
+        .then(() => setIsSpeakingRef.current(true))
+        .catch(e => console.error('[Audio] 播放被阻止:', e))
+      audio.onended = () => {
+        setIsSpeakingRef.current(false)
+        audioObjRef.current = null
+        URL.revokeObjectURL(url)
+      }
+      audio.onerror = () => {
+        setIsSpeakingRef.current(false)
+        audioObjRef.current = null
+      }
+    } catch (e) {
+      console.error('[Audio] 解码失败:', e)
+    }
   }
 
-  // 统一的 handlers，只定义一次
+  const playAudioRef = useRef(playAudio)
+  playAudioRef.current = playAudio
+
   const makeHandlers = () => ({
     onOpen: () => setWsStatus('connected'),
     onClose: () => { setWsStatus('disconnected'); wsRef.current = null },
@@ -62,11 +88,21 @@ export default function ChatWindow() {
         m.id === activeIdRef.current ? { ...m, researchData: data } : m
       ))
     },
+    onSources: (sources) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, sources } : m
+      ))
+    },
     onContentPatch: (patch) => {
       setMessages(prev => prev.map(m =>
         m.id === activeIdRef.current
           ? { ...m, content: (m.content || '') + patch, thinking: false }
           : m
+      ))
+    },
+    onContentReset: () => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, content: '' } : m
       ))
     },
     onRetry: (count) => {
@@ -88,6 +124,10 @@ export default function ChatWindow() {
       ))
       activeIdRef.current = null
       setLoading(false)
+    },
+    onAudio: (base64Data) => {
+      // 通过 ref 调用，确保拿到最新的 playAudio
+      playAudioRef.current(base64Data)
     },
   })
 
@@ -125,7 +165,7 @@ export default function ChatWindow() {
       await connectWS()
     }
 
-    const sent = wsRef.current?.send(message)
+    const sent = wsRef.current?.send(message, ttsLangRef.current, ttsEnabled)
     if (!sent) {
       setMessages(prev => prev.map(m =>
         m.id === assistantId
@@ -157,6 +197,9 @@ export default function ChatWindow() {
           disabled={loading}
           loading={loading}
         />
+
+        {/* 朗读控制按钮已移至消息气泡右下角 */}
+
         <div className="text-center mt-2 text-xs flex items-center justify-center gap-2" style={{ color: theme.textFaint }}>
           <span
             className="w-1.5 h-1.5 rounded-full inline-block"

@@ -1,6 +1,6 @@
 import { useTheme } from '../ThemeContext'
 
-export default function Header() {
+export default function Header({ onSettingsClick, settingsOpen }) {
   const { theme, mode, toggle } = useTheme()
 
   return (
@@ -39,10 +39,15 @@ export default function Header() {
 
         {/* 设置图标 */}
         <button
+          onClick={onSettingsClick}
           className="w-8 h-8 rounded-lg flex items-center justify-center transition-colors"
-          style={{ color: theme.textMuted, background: 'transparent' }}
-          onMouseEnter={e => e.currentTarget.style.background = theme.border}
-          onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
+          style={{
+            color: settingsOpen ? '#1d6fe8' : theme.textMuted,
+            background: settingsOpen ? 'rgba(29,111,232,0.12)' : 'transparent',
+          }}
+          onMouseEnter={e => { if (!settingsOpen) e.currentTarget.style.background = theme.border }}
+          onMouseLeave={e => { if (!settingsOpen) e.currentTarget.style.background = 'transparent' }}
+          title="设置"
         >
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
             <circle cx="12" cy="12" r="3"/>
