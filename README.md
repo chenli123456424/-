@@ -1,73 +1,95 @@
-# 小智数字助手（Xiaozhi Digital Assistant）
+# 小智数码助手
 
-AI 驱动的数字助手，基于阿里通义千问模型，提供智能对话和内容生成能力。
+基于 React + FastAPI + LangGraph 构建的 AI 数码助手，支持深度搜索、方言朗读和持久化对话记忆。
 
-## 项目结构
+---
 
-```
-├── backend/                 # FastAPI 后端应用
-│   ├── main.py              # FastAPI 主应用
-│   ├── config.py            # 配置管理
-│   ├── llm_wrapper.py       # 通义千问 LLM 封装
-│   ├── llm_service.py       # LLM 服务示例
-│   ├── requirements.txt      # Python 依赖
-│   ├── .env.example         # 环境变量模板
-│   └── .gitignore           # Git 忽略文件
-│
-├── frontend/                # React 前端应用
-│   ├── src/
-│   │   ├── main.jsx         # 入口文件
-│   │   ├── App.jsx          # 主应用组件
-│   │   ├── index.css        # 全局样式
-│   │   └── components/      # React 组件
-│   │       ├── ChatWindow.jsx
-│   │       ├── Header.jsx
-│   │       ├── MessageBubble.jsx
-│   │       ├── InputBox.jsx
-│   │       └── index.js
-│   ├── index.html           # HTML 入口
-│   ├── package.json         # Node 依赖
-│   ├── vite.config.js       # Vite 配置
-│   ├── tailwind.config.js   # Tailwind CSS 配置
-│   ├── postcss.config.js    # PostCSS 配置
-│   ├── .gitignore           # Git 忽略文件
-│   └── .env.example         # 环境变量模板
-│
-└── README.md                # 项目文档
+## 技术栈
+
+| 层级 | 技术 |
+|------|------|
+| 前端 | React 18 + Vite + Tailwind CSS |
+| 后端 | FastAPI + LangGraph + Dashscope |
+| 搜索 | Tavily Search API |
+| TTS  | 火山引擎语音合成 |
+| 部署 | Docker + Nginx |
+
+---
+
+## 快速开始（Docker，推荐）
+
+### 1. 克隆项目
+
+```bash
+git clone <your-repo-url>
+cd xiaozhi-digital-assistant
 ```
 
-## 快速开始
+### 2. 配置环境变量
 
-### 1. 后端设置
+```bash
+cp .env.example .env
+```
+
+编辑 `.env`，填入你的 API Key：
+
+```env
+# 通义千问（必填）
+DASHSCOPE_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# Tavily 搜索（必填，深度搜索功能需要）
+TAVILY_API_KEY=tvly-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 火山引擎 TTS（选填，不填则关闭朗读功能）
+VOLC_APP_ID=your_app_id
+VOLC_ACCESS_KEY=your_access_key
+VOLC_SECRET_KEY=your_secret_key
+VOLC_TOKEN=your_token
+```
+
+### 3. 启动服务
+
+```bash
+docker compose up --build
+```
+
+启动完成后访问：**http://localhost:3000**
+
+> 后端 API 运行在 http://localhost:8000，前端通过 Nginx 反代自动转发。
+
+### 4. 停止服务
+
+```bash
+docker compose down
+```
+
+---
+
+## 本地开发（不用 Docker）
+
+### 后端
 
 ```bash
 cd backend
 
 # 创建虚拟环境
 python -m venv venv
-
-# 激活虚拟环境
-# Windows:
-venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
+venv\Scripts\activate      # Windows
+# source venv/bin/activate  # macOS/Linux
 
 # 安装依赖
 pip install -r requirements.txt
 
-# 配置环境变量
+# 配置环境变量（复制并填写 key）
 cp .env.example .env
-# 编辑 .env 文件，填入 DASHSCOPE_API_KEY
 
-# 启动服务
-python main.py
+# 启动后端
+python run.py
 # 或
-uvicorn main:app --reload
+uvicorn main:app --reload --port 8000
 ```
 
-后端 API 文档: http://localhost:8000/docs
-
-### 2. 前端设置
+### 前端
 
 ```bash
 cd frontend
@@ -75,115 +97,55 @@ cd frontend
 # 安装依赖
 npm install
 
-# 开发模式
+# 启动开发服务器
 npm run dev
-
-# 构建
-npm run build
-
-# 预览
-npm run preview
+# 访问 http://localhost:5173
 ```
 
-前端应用: http://localhost:5173
+---
 
-## 第一阶段任务
+## 项目结构
 
-### Task 1.1: FastAPI 后端初始化 ✅
-- ✅ 初始化 FastAPI 环境
-- ✅ 配置环境变量（API_KEY）
-- ✅ 设置 CORS 中间件
-- ✅ 创建健康检查端点
-
-文件:
-- `backend/main.py` - FastAPI 主应用
-- `backend/config.py` - 配置管理
-- `backend/requirements.txt` - 依赖管理
-- `backend/.env.example` - 环境变量模板
-
-### Task 1.2: 通义千问 LLM 集成 ✅
-- ✅ 封装 Tongyi LLM 调用类
-- ✅ 支持单轮对话和多轮对话
-- ✅ 集成 LangChain Community
-- ✅ 实现对话历史管理
-
-文件:
-- `backend/llm_wrapper.py` - LLM 封装类
-- `backend/llm_service.py` - 集成示例
-
-### Task 1.3: React 前端脚手架 ✅
-- ✅ 初始化 React + Vite 项目
-- ✅ 集成 Tailwind CSS
-- ✅ 创建聊天界面组件
-- ✅ 配置 API 代理
-
-文件:
-- `frontend/src/App.jsx` - 主应用
-- `frontend/src/components/` - UI 组件
-- `frontend/index.html` - HTML 入口
-- `frontend/package.json` - 依赖管理
-- `frontend/vite.config.js` - Vite 配置
-- `frontend/tailwind.config.js` - Tailwind 配置
-
-## API 端点
-
-### 健康检查
 ```
-GET /health
+├── backend/
+│   ├── main.py                  # FastAPI 入口，WebSocket 端点
+│   ├── config.py                # 环境变量配置
+│   ├── requirements.txt         # Python 依赖
+│   ├── Dockerfile
+│   └── services/
+│       ├── langgraph_agent.py   # LangGraph 多节点推理链
+│       ├── memory_service.py    # 对话记忆（滑动窗口 + 摘要压缩）
+│       └── tts_service.py       # 火山引擎 TTS
+├── frontend/
+│   ├── src/
+│   │   ├── components/          # React 组件
+│   │   ├── api/websocket.js     # WebSocket 客户端
+│   │   ├── SpeakingContext.jsx  # 朗读状态管理
+│   │   └── ThemeContext.jsx     # 主题管理
+│   ├── public/                  # 静态资源（favicon 等）
+│   ├── nginx.conf               # Nginx 反代配置
+│   └── Dockerfile
+├── docker-compose.yml
+├── .env.example                 # 环境变量模板
+└── README.md
 ```
 
-### 聊天
-```
-POST /chat
-Content-Type: application/json
+---
 
-{
-  "message": "你好",
-  "conversation_id": "optional",
-  "temperature": 0.7,
-  "max_tokens": null
-}
+## 功能说明
 
-Response:
-{
-  "response": "你好！...",
-  "conversation_id": "xxx",
-  "tokens_used": 50
-}
-```
+- **深度搜索**：通过 Tavily 实时搜索，LangGraph 多节点推理（Planner → Researcher → Synthesizer → Critic）
+- **方言朗读**：支持普通话、闽南语、东北话、陕西话，火山引擎 TTS 合成
+- **持久化记忆**：滑动窗口保留最近 10 轮对话，超出部分自动 LLM 压缩为摘要，跨轮次理解上下文
+- **设置面板**：侧边栏滑出设置，支持方言切换和朗读开关
+- **参考来源**：搜索来源以 favicon 标签形式展示在回复气泡底部
 
-## 技术栈
+---
 
-### 后端
-- **框架**: FastAPI
-- **服务器**: Uvicorn
-- **LLM**: LangChain + Tongyi (阿里通义千问)
-- **配置管理**: Pydantic Settings
+## API Key 获取
 
-### 前端
-- **框架**: React 18
-- **构建工具**: Vite
-- **样式**: Tailwind CSS
-- **HTTP 客户端**: Axios
-
-## 环境变量
-
-### 后端 (.env)
-```
-DASHSCOPE_API_KEY=your_api_key_here
-DEBUG=True
-API_HOST=0.0.0.0
-API_PORT=8000
-```
-
-## 下一步
-
-第二阶段：核心功能扩展
-- 多种对话模式（翻译、代码生成等）
-- 对话上下文管理和持久化
-- 用户认证系统
-- 对话历史导出
-
-## 许可证
-
-MIT
+| 服务 | 获取地址 |
+|------|---------|
+| 通义千问 | https://dashscope.aliyun.com |
+| Tavily | https://tavily.com |
+| 火山引擎 TTS | https://www.volcengine.com/product/tts |
