@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useTheme } from '../ThemeContext'
 
-export default function InputBox({ onSendMessage, disabled }) {
+export default function InputBox({ onSendMessage, onStop, disabled, loading }) {
   const { theme } = useTheme()
   const [input, setInput] = useState('')
 
@@ -51,21 +51,36 @@ export default function InputBox({ onSendMessage, disabled }) {
         </button>
       </div>
 
-      <button
-        type="submit"
-        disabled={!canSend}
-        className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-all"
-        style={{
-          background: canSend ? theme.sendBtn : theme.input,
-          color: canSend ? '#fff' : theme.textMuted,
-          border: `1px solid ${theme.inputBorder}`
-        }}
-      >
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
-          <line x1="22" y1="2" x2="11" y2="13"/>
-          <polygon points="22 2 15 22 11 13 2 9 22 2"/>
-        </svg>
-      </button>
+      {/* 发送 / 停止 按钮 */}
+      {loading ? (
+        <button
+          type="button"
+          onClick={onStop}
+          className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-all"
+          style={{ background: '#dc2626', color: '#fff', border: '1px solid #dc2626' }}
+          title="停止回答"
+        >
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
+            <rect x="4" y="4" width="16" height="16" rx="2"/>
+          </svg>
+        </button>
+      ) : (
+        <button
+          type="submit"
+          disabled={!canSend}
+          className="w-10 h-10 rounded-xl flex items-center justify-center shrink-0 transition-all"
+          style={{
+            background: canSend ? theme.sendBtn : theme.input,
+            color: canSend ? '#fff' : theme.textMuted,
+            border: `1px solid ${theme.inputBorder}`
+          }}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+        </button>
+      )}
     </form>
   )
 }

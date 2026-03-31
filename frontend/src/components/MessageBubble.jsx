@@ -167,7 +167,7 @@ export default function MessageBubble({ message }) {
             wordBreak: 'break-word'
           }}
         >
-          {message.thinking && !message.content ? (
+          {message.thinking && !message.content && !message.stopped ? (
             <span className="flex items-center gap-2" style={{ color: theme.textMuted }}>
               <span className="flex gap-1">
                 <span className="w-1.5 h-1.5 rounded-full bg-blue-400 animate-bounce" style={{ animationDelay: '0ms' }}></span>
@@ -176,10 +176,11 @@ export default function MessageBubble({ message }) {
               </span>
               思考中...
             </span>
+          ) : message.stopped && !message.content ? (
+            <span style={{ color: theme.textMuted }}>⏹ 回复已中断</span>
           ) : message.error ? (
             message.content
-          ) : (
-            <ReactMarkdown
+          ) : (            <ReactMarkdown
               remarkPlugins={[remarkGfm]}
               components={{
                 h1: ({children}) => <h1 className="text-lg font-bold mt-3 mb-1" style={{ color: theme.text }}>{children}</h1>,
@@ -216,6 +217,11 @@ export default function MessageBubble({ message }) {
             </ReactMarkdown>
           )}
         </div>
+
+        {/* 中断提示 */}
+        {message.stopped && message.content && (
+          <div className="mt-1 text-xs" style={{ color: theme.textFaint }}>⏹ 回复已中断</div>
+        )}
 
         {/* 重试次数提示 */}
         {message.retryCount > 0 && (

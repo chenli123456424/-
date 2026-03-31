@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from 'react'
 import { useTheme } from '../ThemeContext'
 import MessageBubble from './MessageBubble'
 import InputBox from './InputBox'
+import { ChatWebSocket } from '../api/websocket'
 
 const INITIAL_MESSAGES = [
   { id: 1, type: 'assistant', content: '你好！我是小智数码助手，可以为您提供深度搜索、方言朗读以及智能问答服务。有什么我可以帮助你的吗？' }
@@ -11,120 +12,133 @@ export default function ChatWindow() {
   const { theme } = useTheme()
   const [messages, setMessages] = useState(INITIAL_MESSAGES)
   const [loading, setLoading] = useState(false)
-  const [conversationId, setConversationId] = useState(null)
+  const [wsStatus, setWsStatus] = useState('disconnected')
   const messagesEndRef = useRef(null)
+  const wsRef = useRef(null)
+  const activeIdRef = useRef(null)
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
-  const handleSendMessage = async (message) => {
-    if (!message.trim()) return
+  // 用 ref 存 activeId，避免闭包问题
+  const updateActive = (updater) => {
+    setMessages(prev => prev.map(m =>
+      m.id === activeIdRef.current ? updater(m) : m
+    ))
+  }
 
-    const userMsg = { id: Date.now(), type: 'user', content: message }
-    setMessages(prev => [...prev, userMsg])
+  // 统一的 handlers，只定义一次
+  const makeHandlers = () => ({
+    onOpen: () => setWsStatus('connected'),
+    onClose: () => { setWsStatus('disconnected'); wsRef.current = null },
+    onError: (err) => {
+      setWsStatus('error')
+      setLoading(false)
+      if (activeIdRef.current) {
+        setMessages(prev => prev.map(m =>
+          m.id === activeIdRef.current
+            ? { ...m, content: `错误: ${err}`, error: true, thinking: false }
+            : m
+        ))
+        activeIdRef.current = null
+      }
+    },
+    onThought: ({ count, source }) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? {
+          ...m, thinking: true, searchingCount: count,
+          searchingSources: [...(m.searchingSources || []), source],
+        } : m
+      ))
+    },
+    onThoughtSummary: (summary) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, thoughtSummary: summary } : m
+      ))
+    },
+    onSearch: (data) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, researchData: data } : m
+      ))
+    },
+    onContentPatch: (patch) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current
+          ? { ...m, content: (m.content || '') + patch, thinking: false }
+          : m
+      ))
+    },
+    onRetry: (count) => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, retryCount: count } : m
+      ))
+    },
+    onDone: () => {
+      setMessages(prev => prev.map(m =>
+        m.id === activeIdRef.current ? { ...m, thinking: false } : m
+      ))
+      activeIdRef.current = null
+      setLoading(false)
+    },
+    onStopped: () => {
+      const id = activeIdRef.current
+      setMessages(prev => prev.map(m =>
+        m.id === id ? { ...m, thinking: false, stopped: true } : m
+      ))
+      activeIdRef.current = null
+      setLoading(false)
+    },
+  })
+
+  const connectWS = async () => {
+    if (wsRef.current?.isConnected) return
+    const ws = new ChatWebSocket(makeHandlers())
+    try {
+      await ws.connect()
+      wsRef.current = ws
+    } catch {
+      setWsStatus('error')
+    }
+  }
+
+  useEffect(() => {
+    connectWS()
+    return () => wsRef.current?.disconnect()
+  }, [])
+
+  const handleSendMessage = async (message) => {
+    if (!message.trim() || loading) return
+
+    setMessages(prev => [...prev, { id: Date.now(), type: 'user', content: message }])
     setLoading(true)
 
     const assistantId = Date.now() + 1
-    // 初始占位：显示思考中状态
+    activeIdRef.current = assistantId
     setMessages(prev => [...prev, {
-      id: assistantId,
-      type: 'assistant',
-      content: '',
-      thinking: true,
-      searchingSources: [],   // 实时累积的来源
-      searchingCount: 0,      // 当前搜索数量
-      thoughtSummary: '',     // 分析总结
-      researchData: null,
-      retryCount: 0,
+      id: assistantId, type: 'assistant', content: '',
+      thinking: true, searchingSources: [], searchingCount: 0,
+      thoughtSummary: '', researchData: null, retryCount: 0,
     }])
 
-    try {
-      const response = await fetch('/api/chat/deep', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message, conversation_id: conversationId })
-      })
+    if (!wsRef.current?.isConnected) {
+      await connectWS()
+    }
 
-      if (!response.ok) throw new Error('请求失败')
-
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let fullContent = ''
-
-      while (true) {
-        const { done, value } = await reader.read()
-        if (done) break
-
-        const lines = decoder.decode(value).split('\n')
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue
-          try {
-            const data = JSON.parse(line.slice(6))
-
-            if (data.type === 'error') {
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                  ? { ...m, content: `错误: ${data.content}`, error: true, thinking: false }
-                  : m
-              ))
-              return
-            }
-
-            // 每找到一个来源，实时追加
-            if (data.type === 'searching') {
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId ? {
-                  ...m,
-                  searchingCount: data.count,
-                  searchingSources: [...(m.searchingSources || []), data.source],
-                  thinking: true,
-                } : m
-              ))
-            }
-
-            // 搜索完成后的分析总结
-            if (data.type === 'thought_summary') {
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                  ? { ...m, thoughtSummary: data.content }
-                  : m
-              ))
-            }
-
-            if (data.type === 'research') {
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId ? { ...m, researchData: data.data } : m
-              ))
-            }
-
-            if (data.type === 'chunk') {
-              fullContent += data.content
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId
-                  ? { ...m, content: fullContent, thinking: false }
-                  : m
-              ))
-            }
-
-            if (data.type === 'done') {
-              setMessages(prev => prev.map(m =>
-                m.id === assistantId ? { ...m, thinking: false } : m
-              ))
-              setConversationId(conversationId || 'default')
-            }
-          } catch {}
-        }
-      }
-    } catch {
+    const sent = wsRef.current?.send(message)
+    if (!sent) {
       setMessages(prev => prev.map(m =>
         m.id === assistantId
-          ? { ...m, content: '抱歉，发生了错误，请稍后再试。', error: true, thinking: false }
+          ? { ...m, content: '发送失败，请刷新页面重试。', error: true, thinking: false }
           : m
       ))
-    } finally {
+      activeIdRef.current = null
       setLoading(false)
     }
+  }
+
+  const handleStop = () => {
+    wsRef.current?.stop()
   }
 
   return (
@@ -137,8 +151,17 @@ export default function ChatWindow() {
       </div>
 
       <div className="px-6 pb-4 pt-3" style={{ borderTop: `1px solid ${theme.border}` }}>
-        <InputBox onSendMessage={handleSendMessage} disabled={loading} />
-        <div className="text-center mt-2 text-xs" style={{ color: theme.textFaint }}>
+        <InputBox
+          onSendMessage={handleSendMessage}
+          onStop={handleStop}
+          disabled={loading}
+          loading={loading}
+        />
+        <div className="text-center mt-2 text-xs flex items-center justify-center gap-2" style={{ color: theme.textFaint }}>
+          <span
+            className="w-1.5 h-1.5 rounded-full inline-block"
+            style={{ background: wsStatus === 'connected' ? '#4ade80' : wsStatus === 'error' ? '#f87171' : '#6b7280' }}
+          />
           POWERED BY QWEN-TURBO · 深度搜索模式已开启
         </div>
       </div>

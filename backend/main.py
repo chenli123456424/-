@@ -1,12 +1,16 @@
 """
 Xiaozhi Digital Assistant - FastAPI Backend
 """
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional
 import logging
+import json
+import asyncio
+import queue
+import threading
 
 from config import settings
 from llm_wrapper import get_llm
@@ -286,6 +290,146 @@ async def chat_deep(request: ChatRequest):
     )
 
 
+# ─────────────────────────────────────────────
+# WebSocket Chat Endpoint
+# ─────────────────────────────────────────────
+
+@app.websocket("/ws/chat")
+async def websocket_chat(websocket: WebSocket):
+    await websocket.accept()
+    logger.info("[WS] Client connected")
+    stop_flag = {"stopped": False}
+
+    async def listen_for_stop():
+        """并发监听客户端消息，收到 stop 立即设置标志"""
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    payload = json.loads(raw)
+                    if payload.get("type") == "stop":
+                        logger.info("[WS] Stop signal received")
+                        stop_flag["stopped"] = True
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    try:
+        while True:
+            # 等待用户发送消息
+            raw = await websocket.receive_text()
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                await websocket.send_text(json.dumps({"type": "error", "data": "Invalid JSON"}))
+                continue
+
+            if payload.get("type") == "stop":
+                continue  # 没有正在运行的任务，忽略
+
+            message = payload.get("message", "").strip()
+            if not message:
+                await websocket.send_text(json.dumps({"type": "error", "data": "Empty message"}))
+                continue
+
+            logger.info(f"[WS] Received: {message}")
+            stop_flag["stopped"] = False
+
+            q = queue.Queue()
+            loop = asyncio.get_event_loop()
+
+            def run_in_thread():
+                try:
+                    for node_name, node_state in stream_agent(message):
+                        if stop_flag["stopped"]:
+                            break
+                        q.put(("node", node_name, node_state))
+                    q.put(("done", None, None))
+                except Exception as e:
+                    q.put(("error", str(e), None))
+
+            thread = threading.Thread(target=run_in_thread, daemon=True)
+            thread.start()
+
+            # 启动并发监听停止信号的任务
+            stop_listener = asyncio.create_task(listen_for_stop())
+
+            try:
+                while True:
+                    if stop_flag["stopped"]:
+                        await websocket.send_text(json.dumps({"type": "stopped", "data": None}))
+                        break
+
+                    try:
+                        item = await loop.run_in_executor(
+                            None, lambda: q.get(timeout=0.2)
+                        )
+                    except Exception:
+                        # timeout，继续检查 stop_flag
+                        continue
+
+                    kind, node_name, node_state = item
+
+                    if kind == "error":
+                        await websocket.send_text(json.dumps({"type": "error", "data": node_name}))
+                        break
+
+                    if kind == "done":
+                        await websocket.send_text(json.dumps({"type": "done", "data": None}))
+                        break
+
+                    if node_name == "planner" and node_state.get("thought_process"):
+                        try:
+                            thought_parsed = json.loads(node_state["thought_process"][0])
+                            sources = thought_parsed.get("sources", [])
+                            analysis = thought_parsed.get("analysis", "")
+                            for i, src in enumerate(sources):
+                                if stop_flag["stopped"]: break
+                                await websocket.send_text(json.dumps({
+                                    "type": "thought",
+                                    "data": {"count": i + 1, "source": src}
+                                }))
+                                await asyncio.sleep(0.15)
+                            if analysis and not stop_flag["stopped"]:
+                                await websocket.send_text(json.dumps({
+                                    "type": "thought_summary", "data": analysis
+                                }))
+                        except Exception:
+                            pass
+
+                    elif node_name == "researcher" and node_state.get("research_data"):
+                        if not stop_flag["stopped"]:
+                            await websocket.send_text(json.dumps({
+                                "type": "search", "data": node_state["research_data"]
+                            }))
+
+                    elif node_name in ("synthesizer", "general_synthesizer") and node_state.get("draft_content"):
+                        answer = node_state["draft_content"]
+                        for i in range(0, len(answer), 8):
+                            if stop_flag["stopped"]: break
+                            await websocket.send_text(json.dumps({
+                                "type": "content_patch", "data": answer[i:i + 8]
+                            }))
+                            await asyncio.sleep(0.01)
+
+                    elif node_name == "critic":
+                        retry_count = node_state.get("retry_count", 0)
+                        if retry_count > 0 and not stop_flag["stopped"]:
+                            await websocket.send_text(json.dumps({
+                                "type": "retry", "data": retry_count
+                            }))
+            finally:
+                stop_listener.cancel()
+
+    except WebSocketDisconnect:
+        logger.info("[WS] Client disconnected")
+    except Exception as e:
+        logger.error(f"[WS] Error: {str(e)}", exc_info=True)
+        try:
+            await websocket.send_text(json.dumps({"type": "error", "data": str(e)}))
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
