@@ -2,6 +2,13 @@
 
 基于 React + FastAPI + LangGraph 构建的 AI 数码助手，支持深度搜索、方言朗读和持久化对话记忆。
 
+# 效果
+![alt text](image.png)
+![alt text](image-1.png)
+![alt text](image-2.png)
+
+# 体验网址：http://121.41.37.200:3000/
+
 ---
 
 ## 技术栈

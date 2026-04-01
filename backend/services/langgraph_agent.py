@@ -43,10 +43,11 @@ IDENTITY_SYSTEM = (
 
 class AgentState(TypedDict):
     query: str
+    resolved_query: str          # 经记忆补全后的完整查询词
     intent: str
     memory_context: str          # 注入的历史记忆上下文
     thought_process: List[str]
-    search_sources: List[dict]   # 真实搜索来源 [{title, url, domain, summary}]
+    search_sources: List[dict]
     research_data: dict
     draft_content: str
     retry_count: int
@@ -98,16 +99,23 @@ def classifier_node(state: AgentState) -> AgentState:
     # 关键词没命中时，结合记忆上下文用 LLM 兜底判断
     if not is_tech:
         try:
-            memory_hint = f"\n历史上下文：\n{state['memory_context']}" if state.get("memory_context") else ""
-            prompt = f"""判断以下问题是否与数码产品、电子设备、科技资讯相关。{memory_hint}
+            memory_hint = f"\n历史对话上下文：\n{state['memory_context']}" if state.get("memory_context") else ""
+            prompt = f"""判断以下问题是否与数码产品、电子设备、科技资讯相关。
+{memory_hint}
 
 当前问题：{state['query']}
+
+判断规则：
+1. 如果问题含有指代词（他/它/这个/那个/上面/之前说的等），且历史对话涉及数码产品，则判断为 tech
+2. 如果问题是追问（大小/价格/参数/怎么样/如何/对比等），且历史对话涉及数码产品，则判断为 tech
+3. 只有与数码/科技完全无关时才判断为 general
 
 只回答 "tech" 或 "general"，不要其他内容。"""
             result = _call_llm(prompt).strip().lower()
             is_tech = "tech" in result
         except Exception:
-            is_tech = False
+            # 有历史上下文时默认 tech，避免漏判
+            is_tech = bool(state.get("memory_context"))
 
     intent = "tech" if is_tech else "general"
     logger.info(f"[Classifier] intent={intent} for query: {state['query']}")
@@ -123,7 +131,7 @@ def planner_node(state: AgentState) -> AgentState:
     memory_context = state.get("memory_context", "")
 
     if state["intent"] == "tech":
-        # 如果有历史上下文，先让 LLM 把模糊问题补全为完整查询词
+        # 先用记忆把模糊问题补全为完整查询词
         search_query = state["query"]
         if memory_context:
             try:
@@ -134,13 +142,16 @@ def planner_node(state: AgentState) -> AgentState:
 
 当前问题：{state['query']}
 
-只输出补全后的查询词（一句话，不超过30字），不要解释。"""
-                expanded = _call_llm(expand_prompt).strip()
+规则：
+- 如果当前问题有指代词（他、它、这个、那个、上面说的等），必须替换为历史中具体的产品名/主题
+- 如果当前问题本身已经完整，直接原样输出
+- 只输出补全后的查询词（不超过30字），不要任何解释"""
+                expanded = _call_llm(expand_prompt).strip().strip('"').strip("'")
                 if expanded and len(expanded) < 60:
                     search_query = expanded
-                    logger.info(f"[Planner] Query expanded: '{state['query']}' → '{search_query}'")
-            except Exception:
-                pass
+                    logger.info(f"[Planner] Query resolved: '{state['query']}' → '{search_query}'")
+            except Exception as e:
+                logger.warning(f"[Planner] Query expand failed: {e}")
 
         try:
             tavily = get_tavily()
@@ -180,7 +191,7 @@ def planner_node(state: AgentState) -> AgentState:
 
     thought_data = json.dumps({"sources": sources, "analysis": analysis}, ensure_ascii=False)
     logger.info(f"[Planner] Got {len(sources)} real sources")
-    return {**state, "thought_process": [thought_data], "search_sources": sources}
+    return {**state, "thought_process": [thought_data], "search_sources": sources, "resolved_query": search_query}
 
 
 # ─────────────────────────────────────────────
@@ -190,14 +201,16 @@ def planner_node(state: AgentState) -> AgentState:
 def researcher_node(state: AgentState) -> AgentState:
     logger.info("[Researcher] Gathering product data via Tavily...")
 
+    # 使用 planner 补全后的完整查询词，而不是原始模糊问题
+    resolved = state.get("resolved_query") or state["query"]
+
     try:
         tavily = get_tavily()
-        # 用更精准的查询词搜索产品参数
-        search_query = f"{state['query']} 参数 价格 规格"
+        search_query = f"{resolved} 参数 价格 规格"
         results = tavily.search(
             query=search_query,
             max_results=5,
-            search_depth="advanced",  # 深度搜索，获取更多内容
+            search_depth="advanced",
         )
         raw_results = results.get("results", [])
         snippets = "\n".join(
@@ -205,32 +218,33 @@ def researcher_node(state: AgentState) -> AgentState:
             for i, r in enumerate(raw_results)
         )
 
-        # 让 LLM 从真实搜索内容中提取结构化产品数据
-        prompt = f"""请从以下真实搜索结果中提取数码产品参数，整理为 JSON。
+        # 让 LLM 从真实搜索内容中自由提取实际存在的信息
+        prompt = f"""请从以下搜索结果中提取与用户问题相关的信息，整理为 JSON。
 
-用户问题：{state['query']}
+用户问题：{resolved}
 
 搜索结果：
 {snippets}
 
+要求：
+1. 只提取搜索结果中实际存在的信息，不要编造或填写"无具体参数"
+2. 根据搜索内容灵活决定字段，不要套固定模板
+   - 如果是产品对比：提取产品名、实际有的参数（价格/CPU/内存/屏幕等）
+   - 如果是新闻资讯：提取标题、要点、时间
+   - 如果是教程/攻略：提取步骤、关键信息
+   - 如果是价格行情：提取商品名、价格区间、平台
+3. 每条数据只包含搜索结果中真实出现的字段，没有的字段直接省略
+4. summary 用一句话总结核心信息
+
 输出 JSON（只输出 JSON，不要其他文字）：
 {{
-  "products": [
+  "items": [
     {{
-      "name": "产品名称",
-      "cpu": "处理器型号",
-      "price": "价格（元）",
-      "memory": "内存",
-      "storage": "存储",
-      "display": "屏幕",
-      "battery": "电池",
-      "source": "来源网址"
+      "字段名": "字段值（只写搜索结果中实际有的）"
     }}
   ],
-  "summary": "一句话总结"
-}}
-
-如果搜索结果中没有具体参数，根据已知知识填写，price 字段必须有数字。"""
+  "summary": "核心信息一句话总结"
+}}"""
 
         response = _call_llm(prompt)
         raw = response.strip()
@@ -246,9 +260,9 @@ def researcher_node(state: AgentState) -> AgentState:
     except Exception as e:
         logger.warning(f"[Researcher] Search failed: {e}, falling back to LLM")
         # 降级：纯 LLM 回答
-        prompt = f"""请整理关于"{state['query']}"的数码产品参数，输出 JSON：
-{{"products": [{{"name": "...", "cpu": "...", "price": "...元", "memory": "...", "storage": "...", "display": "...", "battery": "...", "source": "综合资料"}}], "summary": "..."}}
-只输出 JSON。"""
+        prompt = f"""请根据已有知识整理关于"{resolved}"的信息，输出 JSON：
+{{"items": [{{"字段名": "字段值"}}], "summary": "一句话总结"}}
+只提取真实存在的信息，只输出 JSON。"""
         response = _call_llm(prompt)
         try:
             raw = response.strip().lstrip("```json").lstrip("```").rstrip("```")
@@ -275,13 +289,15 @@ def synthesizer_node(state: AgentState) -> AgentState:
         thoughts_text = ""
 
     memory_context = state.get("memory_context", "")
+    resolved = state.get("resolved_query") or state["query"]
     memory_section = f"\n历史对话上下文（请结合此上下文理解用户意图）：\n{memory_context}\n" if memory_context else ""
 
     retry_hint = "注意：上一版回答不够具体，请确保包含明确的 CPU 型号和价格数字！" if state["retry_count"] > 0 else ""
 
     prompt = f"""请根据以下研究数据，为用户撰写专业的 Markdown 格式数码评测回答。
 {memory_section}
-用户问题：{state['query']}
+用户原始问题：{state['query']}
+实际查询主题：{resolved}
 分析摘要：{thoughts_text}
 研究数据：{research_json}
 
@@ -314,10 +330,11 @@ def general_synthesizer_node(state: AgentState) -> AgentState:
 
 要求：
 1. 用中文回复，语气友好自然
-2. 如果是问候（如"你好"），回复时必须介绍自己是小智数码助手，并引导用户提问数码相关问题
-3. 如果是非数码问题，礼貌回答后引导用户提问数码相关内容
-4. 绝对不能提及通义千问、qwen 或任何底层模型名称
-5. 回复简洁，不超过 100 字"""
+2. 如果结合历史上下文能判断用户在追问数码产品相关内容，直接基于历史信息回答，不要说"请提供更多信息"
+3. 如果是问候（如"你好"），回复时必须介绍自己是小智数码助手，并引导用户提问数码相关问题
+4. 如果是非数码问题，礼貌回答后引导用户提问数码相关内容
+5. 绝对不能提及通义千问、qwen 或任何底层模型名称
+6. 回复简洁，不超过 150 字"""
 
     response = _call_llm(prompt)
     return {**state, "draft_content": response, "research_data": {}}
@@ -445,6 +462,7 @@ def stream_agent(query: str, memory_context: str = ""):
     agent = get_agent()
     initial_state = {
         "query":           query,
+        "resolved_query":  query,
         "intent":          "",
         "memory_context":  memory_context,
         "thought_process": [],

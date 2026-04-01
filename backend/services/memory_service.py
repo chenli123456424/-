@@ -1,107 +1,124 @@
 """
-对话记忆管理服务
-策略：滑动窗口（最近 10 轮）+ 超出部分自动压缩为摘要
-- 短期记忆：最近 MAX_TURNS 轮完整对话，供 LLM 直接引用
-- 长期记忆：超出窗口的历史压缩成一段摘要，保留关键实体和结论
+对话记忆管理服务 v2 — SQLite 持久化版
+流程：
+  1. 每轮对话开始前：load_memories → build_context_from_db（梳理历史 + 推理当前问题关联）
+  2. 每轮对话结束后：LLM 提炼本轮摘要 → save_memory 写入 DB
 """
 import logging
+import json
 from typing import List
 import dashscope
 from dashscope import Generation
+
 from config import settings
+from services.memory_db import save_memory, load_memories, get_turn_count, init_db
 
 logger = logging.getLogger(__name__)
-
 dashscope.api_key = settings.dashscope_api_key
 
-# 滑动窗口大小：保留最近 N 轮（1轮 = 1问 + 1答）
-MAX_TURNS = 10
-# 触发压缩的阈值：超过此轮数时，将最早的 COMPRESS_BATCH 轮压缩进摘要
-COMPRESS_BATCH = 5
+# 每次注入 prompt 的最大历史条数（避免 token 过多）
+MAX_CONTEXT_TURNS = 10
 
 
-class MemoryManager:
+def _call_llm(prompt: str) -> str:
+    resp = Generation.call(
+        model=settings.model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.3,
+        result_format="message",
+    )
+    if resp.status_code == 200:
+        return resp.output.choices[0].message.content.strip()
+    raise RuntimeError(f"LLM error {resp.status_code}")
+
+
+# ─────────────────────────────────────────────
+# 记忆写入：每轮对话结束后调用
+# ─────────────────────────────────────────────
+
+def save_turn_memory(session_id: str, user_query: str,
+                     resolved_query: str, assistant_reply: str):
     """
-    单会话记忆管理器。
-    每个 WebSocket 连接持有一个实例。
+    调用 LLM 对本轮对话提炼摘要和关键词，写入 DB。
+    异步友好：调用方用 run_in_executor 包裹即可。
     """
+    turn_index = get_turn_count(session_id) + 1
 
-    def __init__(self):
-        # 短期记忆：[(user_msg, assistant_msg), ...]
-        self._turns: List[tuple] = []
-        # 长期摘要：将早期对话压缩后的文字
-        self._summary: str = ""
+    prompt = f"""请对以下一轮对话进行关键信息提炼，输出 JSON。
 
-    # ── 公开接口 ──────────────────────────────
+用户问题：{user_query}
+实际查询主题：{resolved_query}
+AI 回复摘要（取前600字）：{assistant_reply[:600]}
 
-    def add_turn(self, user_msg: str, assistant_msg: str):
-        """记录一轮对话，超出窗口时触发压缩"""
-        self._turns.append((user_msg, assistant_msg))
-        if len(self._turns) > MAX_TURNS:
-            self._compress_oldest(COMPRESS_BATCH)
+输出 JSON（只输出 JSON，不要其他文字）：
+{{
+  "summary": "本轮对话的核心信息，不超过150字，保留产品名/价格/参数/结论等关键实体",
+  "keywords": ["关键词1", "关键词2", "关键词3"]
+}}"""
 
-    def build_context(self) -> str:
-        """
-        构建注入 prompt 的上下文字符串。
-        格式：
-          [历史摘要]（如有）
-          [近期对话]
-        """
-        parts = []
+    try:
+        raw = _call_llm(prompt)
+        if raw.startswith("```"):
+            raw = raw.split("```")[1].lstrip("json").strip()
+        data = json.loads(raw)
+        summary = data.get("summary", "")
+        keywords = data.get("keywords", [])
+    except Exception as e:
+        logger.warning(f"[Memory] LLM summarize failed: {e}, using fallback")
+        summary = f"用户问：{user_query}。主题：{resolved_query}。"
+        keywords = []
 
-        if self._summary:
-            parts.append(f"【历史对话摘要】\n{self._summary}")
+    save_memory(session_id, turn_index, user_query, resolved_query, summary, keywords)
 
-        if self._turns:
-            recent_lines = []
-            for u, a in self._turns:
-                recent_lines.append(f"用户：{u}")
-                # 助手回复可能很长，截取前 300 字避免 token 过多
-                a_short = a[:300] + "…" if len(a) > 300 else a
-                recent_lines.append(f"小智：{a_short}")
-            parts.append("【近期对话】\n" + "\n".join(recent_lines))
 
-        return "\n\n".join(parts) if parts else ""
+# ─────────────────────────────────────────────
+# 记忆读取：每轮对话开始前调用
+# ─────────────────────────────────────────────
 
-    def has_context(self) -> bool:
-        return bool(self._turns or self._summary)
+def build_memory_context(session_id: str, current_query: str) -> str:
+    """
+    从 DB 加载历史记忆，让 LLM 梳理后生成注入 prompt 的上下文字符串。
+    包含：历史摘要列表 + 对当前问题的关联推理。
+    """
+    memories = load_memories(session_id, limit=MAX_CONTEXT_TURNS)
+    if not memories:
+        return ""
 
-    def clear(self):
-        self._turns = []
-        self._summary = ""
+    # 构建历史摘要列表文本
+    history_lines = []
+    for m in memories:
+        kw_str = "、".join(json.loads(m["keywords"])) if m.get("keywords") else ""
+        line = f"第{m['turn_index']}轮 [{kw_str}]：{m['summary']}"
+        history_lines.append(line)
+    history_text = "\n".join(history_lines)
 
-    # ── 内部压缩 ──────────────────────────────
+    # 让 LLM 推理当前问题与历史的关联，生成精炼上下文
+    prompt = f"""以下是用户与小智数码助手的历史对话摘要列表：
 
-    def _compress_oldest(self, n: int):
-        """将最早的 n 轮对话压缩进 _summary，从 _turns 中移除"""
-        to_compress = self._turns[:n]
-        self._turns = self._turns[n:]
+{history_text}
 
-        dialog_text = "\n".join(
-            f"用户：{u}\n小智：{a}" for u, a in to_compress
-        )
+用户当前提问：{current_query}
 
-        prompt = f"""请将以下对话片段压缩为一段简洁的摘要（不超过200字），
-保留关键实体（产品名、价格、参数、用户偏好等）和重要结论，去掉寒暄和无关内容。
+请完成两件事：
+1. 判断当前问题是否与历史对话有关联（如指代词"他/它/那个"、追问、对比等）
+2. 输出一段简洁的上下文说明（不超过200字），供 AI 理解当前问题的完整背景
 
-{'已有摘要：' + self._summary + chr(10) if self._summary else ''}对话片段：
-{dialog_text}
+只输出上下文说明文字，不要标题或编号。如果当前问题与历史完全无关，输出"无相关历史上下文"。"""
 
-只输出摘要文字，不要标题或前缀。"""
-
-        try:
-            resp = Generation.call(
-                model=settings.model_name,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=0.3,
-                result_format="message",
+    try:
+        context = _call_llm(prompt)
+        if context == "无相关历史上下文":
+            # 无关联时仍保留最近几轮的原始摘要，供 LLM 参考
+            recent = memories[-3:]
+            context = "近期对话摘要：\n" + "\n".join(
+                f"第{m['turn_index']}轮：{m['summary']}" for m in recent
             )
-            if resp.status_code == 200:
-                self._summary = resp.output.choices[0].message.content.strip()
-                logger.info(f"[Memory] Compressed {n} turns → summary({len(self._summary)} chars)")
-            else:
-                # 压缩失败时退化：直接拼接旧摘要
-                self._summary = (self._summary + "\n" + dialog_text[:400]).strip()
-        except Exception as e:
-            logger.warning(f"[Memory] Compression failed: {e}, using fallback")
-            self._summary = (self._summary + "\n" + dialog_text[:400]).strip()
+        logger.info(f"[Memory] Context built for session {session_id[:8]}…")
+        return context
+    except Exception as e:
+        logger.warning(f"[Memory] Context build failed: {e}")
+        # 降级：直接返回最近3轮摘要
+        recent = memories[-3:]
+        return "近期对话摘要：\n" + "\n".join(
+            f"第{m['turn_index']}轮：{m['summary']}" for m in recent
+        )

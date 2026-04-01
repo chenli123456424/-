@@ -13,6 +13,16 @@
 
 const WS_URL = `ws://${window.location.hostname}:8000/ws/chat`
 
+// 从 localStorage 获取或生成持久化 session_id
+function getSessionId() {
+  let sid = localStorage.getItem('xz_session_id')
+  if (!sid) {
+    sid = 'sess-' + crypto.randomUUID()
+    localStorage.setItem('xz_session_id', sid)
+  }
+  return sid
+}
+
 export class ChatWebSocket {
   constructor(handlers = {}) {
     this.ws = null
@@ -84,7 +94,12 @@ export class ChatWebSocket {
 
   send(message, lang = 'zh', ttsEnabled = true) {
     if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ message, lang, tts_enabled: ttsEnabled }))
+      this.ws.send(JSON.stringify({
+        message,
+        lang,
+        tts_enabled: ttsEnabled,
+        session_id: getSessionId(),
+      }))
       return true
     }
     return false

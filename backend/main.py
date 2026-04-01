@@ -16,7 +16,11 @@ from config import settings
 from llm_wrapper import get_llm
 from services.langgraph_agent import run_agent, stream_agent
 from services.tts_service import generate_audio_async
-from services.memory_service import MemoryManager
+from services.memory_service import build_memory_context, save_turn_memory
+from services.memory_db import init_db
+
+# 启动时初始化数据库
+init_db()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -301,18 +305,16 @@ async def websocket_chat(websocket: WebSocket):
     await websocket.accept()
     logger.info("[WS] Client connected")
 
-    # 每个连接独立的记忆管理器
-    memory = MemoryManager()
+    # session_id 由前端生成并通过第一条消息传入
+    session_id: str = ""
 
     async def safe_send(data: str) -> bool:
-        """安全发送，连接已关闭时静默忽略"""
         try:
             await websocket.send_text(data)
             return True
         except Exception:
             return False
 
-    # 所有客户端消息统一放入此队列，避免并发 recv
     ctrl_q: asyncio.Queue = asyncio.Queue()
 
     async def read_all_client_messages():
@@ -344,6 +346,12 @@ async def websocket_chat(websocket: WebSocket):
             message = payload.get("message", "").strip()
             tts_lang = payload.get("lang", "zh")
             tts_enabled = payload.get("tts_enabled", True)
+
+            # 首次消息时确定 session_id
+            if not session_id:
+                session_id = payload.get("session_id", "") or f"anon-{id(websocket)}"
+                logger.info(f"[WS] Session: {session_id[:16]}…")
+
             if not message:
                 await safe_send(json.dumps({"type": "error", "data": "Empty message"}))
                 continue
@@ -351,11 +359,13 @@ async def websocket_chat(websocket: WebSocket):
             logger.info(f"[WS] Received: {message}, lang={tts_lang}")
             stop_flag["stopped"] = False
 
-            # 构建记忆上下文注入 agent
-            memory_context = memory.build_context()
+            # 从 DB 构建记忆上下文（在线程池里跑，避免阻塞事件循环）
+            loop = asyncio.get_event_loop()
+            memory_context = await loop.run_in_executor(
+                None, build_memory_context, session_id, message
+            )
 
             q = queue.Queue()
-            loop = asyncio.get_event_loop()
 
             def run_in_thread():
                 try:
@@ -371,6 +381,7 @@ async def websocket_chat(websocket: WebSocket):
             thread.start()
 
             final_answer = ""
+            final_resolved = message  # 记录 planner 补全后的查询词
 
             while True:
                 while not ctrl_q.empty():
@@ -402,10 +413,13 @@ async def websocket_chat(websocket: WebSocket):
                     break
 
                 if kind == "done":
-                    # 将本轮对话存入记忆
+                    # 本轮对话结束，异步写入记忆 DB
                     if final_answer and not stop_flag["stopped"]:
-                        memory.add_turn(message, final_answer)
-                        logger.info(f"[Memory] Saved turn, total={len(memory._turns)} turns")
+                        await loop.run_in_executor(
+                            None, save_turn_memory,
+                            session_id, message, final_resolved, final_answer
+                        )
+                        logger.info(f"[Memory] Turn saved for session {session_id[:8]}…")
 
                     await safe_send(json.dumps({"type": "done", "data": None}))
                     if final_answer and not stop_flag["stopped"] and tts_enabled:
@@ -421,6 +435,8 @@ async def websocket_chat(websocket: WebSocket):
                     break
 
                 if node_name == "planner" and node_state.get("thought_process"):
+                    # 记录 resolved_query
+                    final_resolved = node_state.get("resolved_query") or message
                     try:
                         thought_parsed = json.loads(node_state["thought_process"][0])
                         sources = thought_parsed.get("sources", [])
@@ -447,12 +463,9 @@ async def websocket_chat(websocket: WebSocket):
                 elif node_name in ("synthesizer", "general_synthesizer") and node_state.get("draft_content"):
                     answer = node_state["draft_content"]
                     final_answer = answer
-                    # 推送来源列表（供前端气泡底部展示）
                     sources = node_state.get("search_sources", [])
                     if sources:
-                        await safe_send(json.dumps({
-                            "type": "sources", "data": sources
-                        }))
+                        await safe_send(json.dumps({"type": "sources", "data": sources}))
                     await safe_send(json.dumps({"type": "content_reset", "data": None}))
                     for i in range(0, len(answer), 8):
                         if stop_flag["stopped"]: break
@@ -464,9 +477,7 @@ async def websocket_chat(websocket: WebSocket):
                 elif node_name == "critic":
                     retry_count = node_state.get("retry_count", 0)
                     if retry_count > 0 and not stop_flag["stopped"]:
-                        await safe_send(json.dumps({
-                            "type": "retry", "data": retry_count
-                        }))
+                        await safe_send(json.dumps({"type": "retry", "data": retry_count}))
 
     except WebSocketDisconnect:
         logger.info("[WS] Client disconnected")

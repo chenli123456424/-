@@ -123,7 +123,12 @@ function SourcesBar({ sources, theme }) {
 
 function ResearchPanel({ data, theme }) {
   const [open, setOpen] = useState(false)
-  if (!data?.products?.length) return null
+  const items = data?.items || data?.products || []
+  if (!items.length) return null
+
+  // 收集所有出现过的字段（排除 source）
+  const allKeys = [...new Set(items.flatMap(item => Object.keys(item).filter(k => k !== 'source')))]
+
   return (
     <div className="mb-2">
       <button
@@ -135,7 +140,7 @@ function ResearchPanel({ data, theme }) {
           <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
           <polyline points="14 2 14 8 20 8"/>
         </svg>
-        研究数据 ({data.products.length} 款产品)
+        搜索数据 ({items.length} 条)
         <span style={{ fontSize: 10 }}>{open ? '▲' : '▼'}</span>
       </button>
       {open && (
@@ -146,19 +151,17 @@ function ResearchPanel({ data, theme }) {
           <table className="w-full text-left" style={{ borderCollapse: 'collapse' }}>
             <thead>
               <tr style={{ borderBottom: `1px solid ${theme.border}` }}>
-                {['产品', 'CPU', '价格', '内存', '来源'].map(h => (
-                  <th key={h} className="py-1 pr-3 font-medium" style={{ color: theme.text }}>{h}</th>
+                {allKeys.map(k => (
+                  <th key={k} className="py-1 pr-3 font-medium whitespace-nowrap" style={{ color: theme.text }}>{k}</th>
                 ))}
               </tr>
             </thead>
             <tbody>
-              {data.products.map((p, i) => (
+              {items.map((item, i) => (
                 <tr key={i} style={{ borderBottom: `1px solid ${theme.border}20` }}>
-                  <td className="py-1 pr-3">{p.name || '-'}</td>
-                  <td className="py-1 pr-3">{p.cpu || '-'}</td>
-                  <td className="py-1 pr-3">{p.price || '-'}</td>
-                  <td className="py-1 pr-3">{p.memory || '-'}</td>
-                  <td className="py-1 pr-3">{p.source || '-'}</td>
+                  {allKeys.map(k => (
+                    <td key={k} className="py-1 pr-3 align-top">{item[k] ?? '-'}</td>
+                  ))}
                 </tr>
               ))}
             </tbody>

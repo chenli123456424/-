@@ -149,6 +149,7 @@ export default function ChatWindow() {
 
   const handleSendMessage = async (message) => {
     if (!message.trim() || loading) return
+    stopAudio()  // 发新消息时中断上一条朗读
 
     setMessages(prev => [...prev, { id: Date.now(), type: 'user', content: message }])
     setLoading(true)
